@@ -26,9 +26,13 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     """
     Infinite iterator over document batches (list of text strings) from parquet files.
 
-    Handles DDP sharding and approximate resume. Each yield is (text_batch, (pq_idx, rg_idx, epoch))
-    where text_batch is a list of document strings, indices track position for resumption,
-    and epoch counts how many times we've cycled through the dataset (starts at 1).
+    Handles DDP sharding by global slot index so every rank gets the same number of
+    yields even when some parquet files have fewer row groups than world_size (avoids
+    NCCL timeouts from ranks that would otherwise get no data). Supports approximate resume.
+
+    Each yield is (text_batch, (pq_idx, rg_idx, epoch)) where text_batch is a list of
+    document strings, indices track position for resumption, and epoch counts how many
+    times we've cycled through the dataset (starts at 1).
     """
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
 
@@ -40,32 +44,49 @@ def _document_batches(split, resume_state_dict, tokenizer_batch_size):
     resume_rg_idx = resume_state_dict["rg_idx"] if resume_state_dict is not None else None
     resume_epoch = resume_state_dict.get("epoch", 1) if resume_state_dict is not None else 1
     first_pass = True
-    pq_idx = resume_pq_idx
     epoch = resume_epoch
 
     while True:  # iterate infinitely (multi-epoch)
-        pq_idx = resume_pq_idx if first_pass else 0
-        while pq_idx < len(parquet_paths):
+        # Build cumulative row-group counts so we can map global slot -> (pq_idx, rg_idx)
+        cumulative_rg = [0]
+        for filepath in parquet_paths:
+            pf = pq.ParquetFile(filepath)
+            cumulative_rg.append(cumulative_rg[-1] + pf.num_row_groups)
+        total_slots = cumulative_rg[-1]
+        if total_slots == 0:
+            # No row groups in any file (e.g. empty split) – advance epoch and retry
+            first_pass = False
+            epoch += 1
+            continue
+
+        def slot_to_pq_rg(slot):
+            for i in range(len(cumulative_rg) - 1):
+                if cumulative_rg[i] <= slot < cumulative_rg[i + 1]:
+                    return (i, slot - cumulative_rg[i])
+            return (len(parquet_paths) - 1, slot - cumulative_rg[-2])
+
+        # Resume: global slot of last consumed position; this rank skips up to the next slot it owns after that
+        if first_pass and resume_rg_idx is not None:
+            resume_global_slot = cumulative_rg[resume_pq_idx] + resume_rg_idx
+            # First slot after resume for any rank: resume_global_slot + 1
+            k_min = max(0, (resume_global_slot + 1 - ddp_rank + ddp_world_size - 1) // ddp_world_size)
+            start_slot = ddp_rank + k_min * ddp_world_size
+        else:
+            start_slot = ddp_rank
+
+        # Ensure every rank does the same number of yields (avoids collective timeout when
+        # total_slots < world_size): use num_yields_per_rank and wrap slot via modulo.
+        num_yields_per_rank = (total_slots + ddp_world_size - 1) // ddp_world_size
+        for yield_idx in range(num_yields_per_rank):
+            slot = start_slot + yield_idx * ddp_world_size
+            slot_effective = slot % total_slots  # wrap so all ranks get same yield count
+            pq_idx, rg_idx = slot_to_pq_rg(slot_effective)
             filepath = parquet_paths[pq_idx]
             pf = pq.ParquetFile(filepath)
-            # Start from resume point if resuming on same file, otherwise from DDP rank
-            if first_pass and (resume_rg_idx is not None) and (pq_idx == resume_pq_idx):
-                base_idx = resume_rg_idx // ddp_world_size
-                base_idx += 1  # advance by 1 so we don't repeat data after resuming
-                rg_idx = base_idx * ddp_world_size + ddp_rank
-                if rg_idx >= pf.num_row_groups:
-                    pq_idx += 1
-                    continue
-                resume_rg_idx = None  # only do this once
-            else:
-                rg_idx = ddp_rank
-            while rg_idx < pf.num_row_groups:
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], (pq_idx, rg_idx, epoch)
-                rg_idx += ddp_world_size
-            pq_idx += 1
+            rg = pf.read_row_group(rg_idx)
+            batch = rg.column('text').to_pylist()
+            for i in range(0, len(batch), tokenizer_batch_size):
+                yield batch[i : i + tokenizer_batch_size], (pq_idx, rg_idx, epoch)
         first_pass = False
         epoch += 1
 
