@@ -1,3 +1,9 @@
+# Sarah Yurick's notes
+
+This fork has been modified to work with the Nemotron-CC dataset. You can run it with `bash runs/nemotron_speedrun.sh`.
+
+See https://github.com/karpathy/nanochat/compare/master...sarahyurick:nanochat:nemotron for relevant changes.
+
 # nanochat
 
 ![nanochat logo](dev/nanochat.png)
