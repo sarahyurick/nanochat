@@ -31,10 +31,15 @@ SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| 
 
 # -----------------------------------------------------------------------------
 # Generic GPT-4-style tokenizer based on HuggingFace Tokenizer
-from tokenizers import Tokenizer as HFTokenizer
-from tokenizers import pre_tokenizers, decoders, Regex
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
+# Imported lazily so the module can be used without `tokenizers` installed
+# (e.g. when using LlamaTokenizer with pre-tokenized data).
+try:
+    from tokenizers import Tokenizer as HFTokenizer
+    from tokenizers import pre_tokenizers, decoders, Regex
+    from tokenizers.models import BPE
+    from tokenizers.trainers import BpeTrainer
+except ImportError:
+    HFTokenizer = pre_tokenizers = decoders = Regex = BPE = BpeTrainer = None  # type: ignore
 
 class HuggingFaceTokenizer:
     """Light wrapper around HuggingFace Tokenizer for some utilities"""
@@ -156,9 +161,14 @@ class HuggingFaceTokenizer:
 
 # -----------------------------------------------------------------------------
 # Tokenizer based on rustbpe + tiktoken combo
+# rustbpe + tiktoken imported lazily so the module remains usable when neither is
+# installed (e.g. when training on pre-tokenized Llama2 data).
 import pickle
-import rustbpe
-import tiktoken
+try:
+    import rustbpe
+    import tiktoken
+except ImportError:
+    rustbpe = tiktoken = None  # type: ignore
 
 class RustBPETokenizer:
     """Light wrapper around tiktoken (for efficient inference) but train with rustbpe"""
@@ -391,6 +401,17 @@ def get_tokenizer():
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
+    # Dispatch on tokenizer_kind.txt marker. Defaults to RustBPETokenizer
+    # (nanochat's own BPE). When training on pre-tokenized Llama2 data, the
+    # marker is set to "llama" and tokenizer.model lives in the same dir.
+    kind_path = os.path.join(tokenizer_dir, "tokenizer_kind.txt")
+    kind = "rustbpe"
+    if os.path.exists(kind_path):
+        with open(kind_path, "r") as f:
+            kind = f.read().strip()
+    if kind == "llama":
+        from nanochat.llama_tokenizer import LlamaTokenizer
+        return LlamaTokenizer.from_directory(tokenizer_dir)
     # return HuggingFaceTokenizer.from_directory(tokenizer_dir)
     return RustBPETokenizer.from_directory(tokenizer_dir)
 

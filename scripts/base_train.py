@@ -27,6 +27,7 @@ import torch.distributed as dist
 
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
+from nanochat.megatron_dataloader import megatron_data_loader, megatron_data_loader_with_state, _load_weights_arg
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint
@@ -77,6 +78,12 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+# Data source
+parser.add_argument("--data-source", type=str, default="parquet", choices=["parquet", "megatron"], help="parquet=nanochat default (text+tokenizer); megatron=pre-tokenized .bin/.idx files")
+parser.add_argument("--data-dir", type=str, default="", help="(megatron only) directory containing .bin/.idx pairs; required when --data-source=megatron")
+parser.add_argument("--domain-weights", type=str, default="proportional", help="(megatron only) sampling weights across domains: 'proportional' (default), 'uniform', a JSON file path, or an inline JSON dict/list")
+parser.add_argument("--train-fraction", type=float, default=0.99, help="(megatron only) fraction of each domain's docs used for training; the rest is held out as val")
+parser.add_argument("--pile-val-dir", type=str, default="", help="(megatron only) optional second val source (e.g. pretokenized Pile val); reports val/bpb_pile alongside val/bpb")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
@@ -328,8 +335,35 @@ if scaler is not None:
 # -----------------------------------------------------------------------------
 # Initialize the DataLoaders for train/val
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
-train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
-build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+build_pile_val_loader = None
+if args.data_source == "parquet":
+    train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
+    build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
+elif args.data_source == "megatron":
+    if not args.data_dir:
+        raise ValueError("--data-source=megatron requires --data-dir")
+    weights_obj = _load_weights_arg(args.domain_weights)
+    print0(f"Megatron data dir: {args.data_dir}")
+    print0(f"Domain weights spec: {args.domain_weights}")
+    train_loader = megatron_data_loader_with_state(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="train",
+        data_dir=args.data_dir, weights=weights_obj, device=device,
+        resume_state_dict=dataloader_resume_state_dict,
+        train_fraction=args.train_fraction,
+    )
+    build_val_loader = lambda: megatron_data_loader(
+        tokenizer, args.device_batch_size, args.max_seq_len, split="val",
+        data_dir=args.data_dir, weights=weights_obj, device=device,
+        train_fraction=args.train_fraction,
+    )
+    if args.pile_val_dir:
+        print0(f"Pile val dir: {args.pile_val_dir}")
+        build_pile_val_loader = lambda: megatron_data_loader(
+            tokenizer, args.device_batch_size, args.max_seq_len, split="all",
+            data_dir=args.pile_val_dir, weights="proportional", device=device,
+        )
+else:
+    raise ValueError(f"Unknown --data-source={args.data_source!r}")
 x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
 
 # -----------------------------------------------------------------------------
@@ -427,12 +461,20 @@ while True:
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
-        wandb_run.log({
+        log_payload = {
             "step": step,
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
-        })
+        }
+        # Optional second val source (Pile val, etc.)
+        if build_pile_val_loader is not None:
+            pile_val_loader = build_pile_val_loader()
+            with disable_fp8(model):
+                pile_val_bpb = evaluate_bpb(model, pile_val_loader, eval_steps, token_bytes)
+            print0(f"Step {step:05d} | Pile val bpb:   {pile_val_bpb:.6f}")
+            log_payload["val/bpb_pile"] = pile_val_bpb
+        wandb_run.log(log_payload)
         model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
@@ -563,7 +605,15 @@ while True:
         eta_str = f" | eta: {eta_seconds/60:.1f}m"
     else:
         eta_str = ""
-    epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    if "epoch" in dataloader_state_dict:
+        epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
+    else:
+        # megatron loader state: per-domain epochs/cursors
+        epochs_list = dataloader_state_dict.get("epochs", [])
+        if epochs_list:
+            epoch = f"min={min(epochs_list)} max={max(epochs_list)}"
+        else:
+            epoch = "?"
     print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
