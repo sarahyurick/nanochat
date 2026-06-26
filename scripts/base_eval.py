@@ -36,6 +36,7 @@ from nanochat.tokenizer import HuggingFaceTokenizer, get_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
+from nanochat.megatron_dataloader import megatron_data_loader, _load_weights_arg
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 
@@ -185,6 +186,12 @@ def main():
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
+    # Data source (mirrors base_train.py). Defaults preserve old parquet behavior.
+    parser.add_argument('--data-source', type=str, default='parquet', choices=['parquet', 'megatron'])
+    parser.add_argument('--data-dir', type=str, default='', help='(megatron only) directory of .bin/.idx pairs')
+    parser.add_argument('--domain-weights', type=str, default='proportional', help='(megatron only) bpb splits use this to weight domains (val is held-out tail per --train-fraction)')
+    parser.add_argument('--train-fraction', type=float, default=0.99, help='(megatron only) fraction of each domain used for train; rest is val')
+    parser.add_argument('--pile-val-dir', type=str, default='', help='(megatron only) additionally report bpb on a separate Megatron-format val dir (Pile val, etc.)')
     args = parser.parse_args()
 
     # Parse evaluation modes
@@ -269,8 +276,28 @@ def main():
             print0(f"Adjusted split_tokens to {args.split_tokens} (must be divisible by {tokens_per_step})")
         steps = args.split_tokens // tokens_per_step
 
-        for split_name in ["train", "val"]:
-            loader = tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, sequence_len, split_name, device=device)
+        if args.data_source == "parquet":
+            split_loaders = [
+                (split_name, tokenizing_distributed_data_loader_bos_bestfit(
+                    tokenizer, args.device_batch_size, sequence_len, split_name, device=device))
+                for split_name in ["train", "val"]
+            ]
+        else:
+            if not args.data_dir:
+                raise ValueError("--data-source=megatron requires --data-dir")
+            weights_obj = _load_weights_arg(args.domain_weights)
+            split_loaders = [
+                (split_name, megatron_data_loader(
+                    tokenizer, args.device_batch_size, sequence_len, split_name,
+                    data_dir=args.data_dir, weights=weights_obj, device=device,
+                    train_fraction=args.train_fraction))
+                for split_name in ["train", "val"]
+            ]
+            if args.pile_val_dir:
+                split_loaders.append(("pile_val", megatron_data_loader(
+                    tokenizer, args.device_batch_size, sequence_len, "all",
+                    data_dir=args.pile_val_dir, weights="proportional", device=device)))
+        for split_name, loader in split_loaders:
             bpb = evaluate_bpb(model, loader, steps, token_bytes)
             bpb_results[split_name] = bpb
             print0(f"{split_name} bpb: {bpb:.6f}")
@@ -308,6 +335,8 @@ def main():
     if bpb_results:
         report_data[0]["train bpb"] = bpb_results.get("train")
         report_data[0]["val bpb"] = bpb_results.get("val")
+        if "pile_val" in bpb_results:
+            report_data[0]["pile val bpb"] = bpb_results["pile_val"]
 
     if samples:
         report_data.append({f"sample {i}": s for i, s in enumerate(samples)})
