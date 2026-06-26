@@ -402,7 +402,8 @@ def get_report():
     from nanochat.common import get_base_dir, get_dist_info
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     if ddp_rank == 0:
-        report_dir = os.path.join(get_base_dir(), "report")
+        # Allow per-run override so multiple runs don't clobber each other's reports.
+        report_dir = os.environ.get("NANOCHAT_REPORT_DIR") or os.path.join(get_base_dir(), "report")
         return Report(report_dir)
     else:
         return DummyReport()
